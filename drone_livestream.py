@@ -1,108 +1,250 @@
 import cv2
 import numpy as np
+import pandas as pd
+import csv
+import time
 
-# Load the target video
-target_video_path = 'C:/projects/Atumic Robots/Ex2/Autonomous_robots_Ex2/pics/IMG_8155.MOV'
-target_cap = cv2.VideoCapture(target_video_path)
+# Function to calculate Euler angles from a rotation matrix
+def eulerAnglesFromRotationMatrix(R):
+    sy = np.sqrt(R[0, 0] * R[0, 0] + R[1, 0] * R[1, 0])
+    singular = sy < 1e-6
 
-# Aruco dictionary and detector parameters
-aruco_dict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_4X4_100)
-parameters = cv2.aruco.DetectorParameters_create()
+    if not singular:
+        x = np.arctan2(R[2, 1], R[2, 2])
+        y = np.arctan2(-R[2, 0], sy)
+        z = np.arctan2(R[1, 0], R[0, 0])
+    else:
+        x = np.arctan2(-R[1, 2], R[1, 1])
+        y = np.arctan2(-R[2, 0], sy)
+        z = 0
 
-# Storage for target positions and areas
-target_positions = {}
-target_areas = {}
-target_frames = {}
+    return np.degrees(x), np.degrees(y), np.degrees(z)
 
-# Process each frame in the target video
-while target_cap.isOpened():
-    ret, frame = target_cap.read()
-    if not ret:
-        break
+# Function to read baseline data from a CSV file
+def readBaselineCSV(file_path):
+    try:
+        data = pd.read_csv(file_path)
+        return data
+    except Exception as e:
+        print(f"Error reading baseline data from {file_path}: {e}")
+        return None
 
-    # Convert frame to grayscale
-    gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+# Function to compute movement commands based on current and target pose
+def computeMovementCommands(current_pose, target_pose, current_dist, target_dist, marker_pos, frame_size):
+    dist_diff = target_dist - current_dist
+    yaw_diff = target_pose[1] - current_pose[0]
+    pitch_diff = target_pose[2] - current_pose[1]
+    roll_diff = target_pose[3] - current_pose[2]
 
-    # Detect markers in the frame
-    corners_target, ids_target, _ = cv2.aruco.detectMarkers(gray_frame, aruco_dict, parameters=parameters)
+    frame_center_x, frame_center_y = frame_size[1] / 2, frame_size[0] / 2
+    marker_center_x, marker_center_y = np.mean(marker_pos[:, 0]), np.mean(marker_pos[:, 1])
+    center_diff_x = marker_center_x - frame_center_x
+    center_diff_y = marker_center_y - frame_center_y
 
-    if ids_target is not None:
-        for id, corners in zip(ids_target, corners_target):
-            id_ = id[0]
-            area = cv2.contourArea(corners[0])
-            if id_ not in target_areas or area > target_areas[id_]:
-                target_positions[id_] = corners[0].mean(axis=0)
-                target_areas[id_] = area
-                target_frames[id_] = frame
+    commands = []
 
-target_cap.release()
+    if abs(center_diff_x) > 100:  # Increased threshold for horizontal centering
+        commands.append("left" if center_diff_x > 0 else "right")
 
-if not target_positions:
-    print("No markers detected in the target video.")
-    exit(1)
+    if abs(center_diff_y) > 100:  # Increased threshold for vertical centering
+        commands.append("down" if center_diff_y > 0 else "up")
 
+    if abs(dist_diff) > 0.5:  # Increased threshold for distance
+        commands.append("backward" if dist_diff > 0 else "forward")
 
-def calculate_movements(target_pos, live_pos, target_area, live_area):
-    movements = []
-    dx = live_pos[0] - target_pos[0]
-    dy = live_pos[1] - target_pos[1]
-    if abs(dx) > 50:  # Threshold for horizontal movement
-        movements.append('left' if dx > 0 else 'right')
-    if abs(dy) > 50:  # Threshold for vertical movement
-        movements.append('up' if dy > 0 else 'down')
-    if abs(live_area - target_area) / target_area > 0.1:  # Threshold for area difference
-        movements.append('forward' if live_area < target_area else 'backward')
-    return movements
+    if not commands:
+        commands.append("Done")
 
+    return commands
 
-def is_aligned(target_pos, live_pos, target_area, live_area, threshold=50):
-    dx = abs(live_pos[0] - target_pos[0])
-    dy = abs(live_pos[1] - target_pos[1])
-    area_diff = abs(live_area - target_area) / target_area
-    return dx <= threshold and dy <= threshold and area_diff <= 0.1
+# Function to analyze live video stream and detect markers
+def analyzeLiveVideo(baseline_data, target_marker_id):
+    cap = cv2.VideoCapture(1)
 
+    if not cap.isOpened():
+        print("Error: Could not open webcam.")
+        return
 
-# Capture live video from the camera
-cap = cv2.VideoCapture(1)
+    target_data = baseline_data[baseline_data['Marker ID'] == target_marker_id].copy()
 
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
+    if target_data.empty:
+        print(f"Error: No baseline data found for Marker ID {target_marker_id}.")
+        return
 
-    # Convert frame to grayscale
-    gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    if 'Distance' not in target_data.columns:
+        print("Error: 'Distance' column not found in target data.")
+        return
 
-    # Detect markers in the live frame
-    corners_live, ids_live, _ = cv2.aruco.detectMarkers(gray_frame, aruco_dict, parameters=parameters)
+    # Convert 'Distance' column to numeric, handle errors
+    target_data['Distance'] = pd.to_numeric(target_data['Distance'], errors='coerce')
 
-    movements = []
-    if ids_live is not None:
-        for id, corners in zip(ids_live, corners_live):
-            id_ = id[0]
-            if id_ in target_positions:
-                live_pos = corners[0].mean(axis=0)
-                live_area = cv2.contourArea(corners[0])
-                target_pos = target_positions[id_]
-                target_area = target_areas[id_]
-                movement = calculate_movements(target_pos, live_pos, target_area, live_area)
+    # Handle potential missing/NaN values in the 'Distance' column
+    target_data = target_data.dropna(subset=['Distance'])
 
-                if is_aligned(target_pos, live_pos, target_area, live_area):
-                    movements = ['Done!']
-                else:
-                    movements.extend(movement)
+    if target_data.empty:
+        print("Error: No valid entries found in target data after dropping NaN values in 'Distance' column.")
+        return
 
-                # Draw detected markers and movements on the frame
-                cv2.aruco.drawDetectedMarkers(frame, corners_live)
-                for move in movements:
-                    cv2.putText(frame, move, (10, 30 + movements.index(move) * 30), cv2.FONT_HERSHEY_SIMPLEX, 1,
-                                (0, 255, 0), 2, cv2.LINE_AA)
+    try:
+        # Ensure there are no infinite values
+        if not np.isfinite(target_data['Distance']).all():
+            print("Error: 'Distance' column contains infinite values.")
+            return
 
-    # Display the frame with overlayed movements in real-time
-    cv2.imshow('Live Video', frame)
+        # Ensure 'Distance' column is not empty and contains valid data
+        if target_data['Distance'].empty:
+            print("Error: 'Distance' column is empty after processing.")
+            return
 
-    if cv2.waitKey(1) & 0xFF == ord('q'):
-        break
+        target_frame = target_data.loc[target_data['Distance'].idxmax()]
+    except Exception as e:
+        print(f"Error accessing target frame with max distance: {e}")
+        return
 
-cap.release()
-cv2.destroyAllWindows()
+    target_distance = target_frame['Distance']
+    target_yaw = target_frame['Yaw']
+    target_pitch = target_frame['Pitch']
+    target_roll = target_frame['Roll']
+
+    aruco_dict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_4X4_100)
+    parameters = cv2.aruco.DetectorParameters_create()
+
+    camera_matrix = np.array([[921.170702, 0.000000, 459.904354],
+                              [0.000000, 919.018377, 351.238301],
+                              [0.000000, 0.000000, 1.000000]])
+    dist_coeffs = np.array([-0.033458, 0.105152, 0.001256, -0.006647, 0.000000])
+
+    marker_length = 0.14  # ArUco marker size
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = cv2.aruco.detectMarkers(gray_frame, aruco_dict, parameters=parameters)
+
+        if ids is not None:
+            for i in range(len(ids)):
+                id = ids[i][0]
+                if id == target_marker_id:
+                    rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(corners[i], marker_length, camera_matrix, dist_coeffs)
+                    rvec = rvecs[0]
+                    tvec = tvecs[0]
+                    current_distance = np.linalg.norm(tvec)
+                    R, _ = cv2.Rodrigues(rvec)
+                    current_pose = eulerAnglesFromRotationMatrix(R)
+
+                    commands = computeMovementCommands(current_pose, (target_distance, target_yaw, target_pitch, target_roll), current_distance, target_distance, corners[i][0], frame.shape)
+
+                    cv2.aruco.drawDetectedMarkers(frame, corners)
+                    cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, rvec, tvec, 0.1)
+
+                    text_position = (10, 30)
+                    text_spacing = 40
+
+                    cv2.putText(frame, f'Yaw: {current_pose[0]:.2f}', text_position, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+                    text_position = (text_position[0], text_position[1] + text_spacing)
+                    cv2.putText(frame, f'Pitch: {current_pose[1]:.2f}', text_position, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+                    text_position = (text_position[0], text_position[1] + text_spacing)
+                    cv2.putText(frame, f'Roll: {current_pose[2]:.2f}', text_position, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+                    text_position = (text_position[0], text_position[1] + text_spacing)
+                    cv2.putText(frame, f'Distance: {current_distance:.2f}', text_position, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+
+                    if commands:
+                        text_position = (text_position[0], text_position[1] + text_spacing)
+                        cv2.putText(frame, f'Command: {commands}', text_position, cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+                        print("Movement Commands:", commands)
+        else:
+            cv2.putText(frame, 'No Id detected, go backward', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+
+        cv2.imshow('Live Video', frame)
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+# Function to record video from camera and generate CSV of detected markers
+def recordVideoAndGenerateCSV(output_csv_file):
+    cap = cv2.VideoCapture(1)
+
+    if not cap.isOpened():
+        print("Error: Could not open webcam.")
+        return
+
+    aruco_dict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_4X4_100)
+    parameters = cv2.aruco.DetectorParameters_create()
+
+    camera_matrix = np.array([[921.170702, 0.000000, 459.904354],
+                              [0.000000, 919.018377, 351.238301],
+                              [0.000000, 0.000000, 1.000000]])
+    dist_coeffs = np.array([-0.033458, 0.105152, 0.001256, -0.006647, 0.000000])
+
+    marker_length = 0.14  # ArUco marker size
+
+    frame_count = 0
+    marker_data = []
+
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        corners, ids, _ = cv2.aruco.detectMarkers(gray_frame, aruco_dict, parameters=parameters)
+
+        if ids is not None:
+            for i in range(len(ids)):
+                id = ids[i][0]
+                rvecs, tvecs, _ = cv2.aruco.estimatePoseSingleMarkers(corners[i], marker_length, camera_matrix, dist_coeffs)
+                rvec = rvecs[0]
+                tvec = tvecs[0]
+                distance = np.linalg.norm(tvec)
+                R, _ = cv2.Rodrigues(rvec)
+                yaw, pitch, roll = eulerAnglesFromRotationMatrix(R)
+                marker_data.append([frame_count, id, corners[i].tolist(), distance, yaw, pitch, roll])
+
+                cv2.aruco.drawDetectedMarkers(frame, corners)
+                cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, rvec, tvec, 0.1)
+
+        cv2.imshow('Recording Video', frame)
+
+        frame_count += 1
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+    cap.release()
+    cv2.destroyAllWindows()
+
+    # Write marker data to CSV file
+    with open(output_csv_file, mode='w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(['Frame', 'Marker ID', '2D Coordinates', 'Distance', 'Yaw', 'Pitch', 'Roll'])
+        for data in marker_data:
+            writer.writerow(data)
+
+    print(f"Marker data successfully written to {output_csv_file}")
+
+if __name__ == '__main__':
+    baseline_csv_file = 'target_new.csv'
+    baseline_data = readBaselineCSV(baseline_csv_file)
+
+    if baseline_data is not None:
+        print("Options:")
+        print("1. Analyze live video")
+        print("2. Record video and generate target frames CSV")
+        choice = int(input("Enter your choice: "))
+
+        if choice == 1:
+            target_marker_id = int(input("Enter target Marker ID: "))
+            analyzeLiveVideo(baseline_data, target_marker_id)
+        elif choice == 2:
+            output_csv_file = input("Enter the name of the output CSV file: ")
+            recordVideoAndGenerateCSV(output_csv_file)
+        else:
+            print("Invalid choice. Exiting.")
+    else:
+        print("Failed to read baseline data. Exiting.")
+
