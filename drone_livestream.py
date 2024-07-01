@@ -44,7 +44,7 @@ def computeMovementCommands(current_pose, target_pose, current_dist, target_dist
     commands = []
 
     if abs(center_diff_x) > 100:  # Increased threshold for horizontal centering
-        commands.append("left" if center_diff_x > 0 else "right")
+        commands.append("right" if center_diff_x > 0 else "left")
 
     if abs(center_diff_y) > 100:  # Increased threshold for vertical centering
         commands.append("down" if center_diff_y > 0 else "up")
