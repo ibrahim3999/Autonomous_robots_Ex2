@@ -65,7 +65,7 @@ def computeMovementCommands(current_pose, target_pose, current_dist, target_dist
         commands.append("backward" if dist_diff > 0 else "forward")
 
     if abs(smoothed_yaw_diff) > 10:
-        commands.append("turn-left" if smoothed_yaw_diff > 0 else "turn-right")
+        commands.append("turn-right" if smoothed_yaw_diff > 0 else "turn-left")
 
     if not commands:
         commands.append("Done")
